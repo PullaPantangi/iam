@@ -1,0 +1,219 @@
+import boto3
+import json
+import os
+
+from datetime import datetime
+from datetime import timezone
+
+iam = boto3.client('iam')
+secretsmanager = boto3.client('secretsmanager')
+sns = boto3.client('sns')
+
+MAX_KEY_AGE = 90
+
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+
+
+def calculate_age(create_date):
+    now = datetime.now(timezone.utc)
+    return (now - create_date).days
+
+
+def secret_exists(secret_name):
+
+    try:
+        secretsmanager.describe_secret(
+            SecretId=secret_name
+        )
+        return True
+
+    except secretsmanager.exceptions.ResourceNotFoundException:
+        return False
+
+
+def store_secret(username, access_key):
+
+    secret_name = f"iam/{username}/access-key"
+
+    secret_value = {
+        "AccessKeyId": access_key["AccessKeyId"],
+        "SecretAccessKey": access_key["SecretAccessKey"]
+    }
+
+    if secret_exists(secret_name):
+
+        secretsmanager.put_secret_value(
+            SecretId=secret_name,
+            SecretString=json.dumps(secret_value)
+        )
+
+    else:
+
+        secretsmanager.create_secret(
+            Name=secret_name,
+            SecretString=json.dumps(secret_value)
+        )
+
+
+def publish_notification(message):
+
+    if not SNS_TOPIC_ARN:
+        return
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="IAM Access Key Rotation",
+        Message=message
+    )
+
+
+def rotate_user_keys(username):
+
+    response = iam.list_access_keys(
+        UserName=username
+    )
+
+    keys = response["AccessKeyMetadata"]
+
+    active_keys = [
+        k for k in keys
+        if k["Status"] == "Active"
+    ]
+
+    for old_key in active_keys:
+
+        age = calculate_age(
+            old_key["CreateDate"]
+        )
+
+        if age < MAX_KEY_AGE:
+            continue
+
+        print(
+            f"{username} "
+            f"has stale key "
+            f"{old_key['AccessKeyId']}"
+        )
+
+        newer_active_keys = [
+            k for k in active_keys
+            if (
+                k["AccessKeyId"]
+                != old_key["AccessKeyId"]
+            )
+            and calculate_age(
+                k["CreateDate"]
+            ) < MAX_KEY_AGE
+        ]
+
+        #
+        # IDEMPOTENCY CHECK
+        #
+        if newer_active_keys:
+
+            print(
+                f"{username} already rotated."
+            )
+            continue
+
+        #
+        # IAM MAXIMUM = 2 KEYS
+        #
+        if len(keys) >= 2:
+
+            print(
+                f"{username} already has "
+                f"2 keys. Skipping."
+            )
+
+            continue
+
+        #
+        # CREATE NEW KEY
+        #
+        new_key = iam.create_access_key(
+            UserName=username
+        )["AccessKey"]
+
+        print(
+            f"Created new key "
+            f"{new_key['AccessKeyId']}"
+        )
+
+        #
+        # STORE IN SECRETS MANAGER
+        #
+        store_secret(
+            username,
+            new_key
+        )
+
+        #
+        # DEACTIVATE OLD KEY
+        #
+        iam.update_access_key(
+            UserName=username,
+            AccessKeyId=old_key["AccessKeyId"],
+            Status="Inactive"
+        )
+
+        print(
+            f"Disabled old key "
+            f"{old_key['AccessKeyId']}"
+        )
+
+        publish_notification(
+            f"""
+User: {username}
+
+Old Key:
+{old_key['AccessKeyId']}
+
+New Key:
+{new_key['AccessKeyId']}
+
+Status:
+Rotation Successful
+"""
+        )
+
+
+def lambda_handler(event, context):
+
+    paginator = iam.get_paginator(
+        'list_users'
+    )
+
+    total_users = 0
+    rotated_users = 0
+
+    for page in paginator.paginate():
+
+        for user in page["Users"]:
+
+            total_users += 1
+
+            try:
+
+                rotate_user_keys(
+                    user["UserName"]
+                )
+
+                rotated_users += 1
+
+            except Exception as e:
+
+                print(
+                    f"Error processing "
+                    f"{user['UserName']} : {str(e)}"
+                )
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(
+            {
+                "users_processed": total_users,
+                "rotated_users": rotated_users
+            }
+        )
+    }
