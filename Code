@@ -160,11 +160,6 @@ def lambda_handler(event, context):
                 execution_summary["failed_users"].append(f"{user['UserName']} (Error: {str(e)})")
 
     total_rotated = len(execution_summary["rotated_users"])
-    
-    rotated_list_str = "\n".join([f"- {u}" for u in execution_summary["rotated_users"]]) if execution_summary["rotated_users"] else "- None"
-    warned_list_str = "\n".join([f"- {u}" for u in execution_summary["warned_users"]]) if execution_summary["warned_users"] else "- None"
-    failed_list_str = "\n".join([f"- {u}" for u in execution_summary["failed_users"]]) if execution_summary["failed_users"] else "- None"
-
     summary_email_body = f"""
 IAM Access Key Rotation Job Summary
 =============================================
