@@ -1,15 +1,16 @@
 import boto3
 import json
 import os
-
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 
 iam = boto3.client('iam')
 secretsmanager = boto3.client('secretsmanager')
 sns = boto3.client('sns')
+cloudwatch = boto3.client('cloudwatch')
 
 MAX_KEY_AGE = 90
+WARNING_DAYS_1 = 10  # 80 days old
+WARNING_DAYS_2 = 5   # 85 days old
 
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 
@@ -20,200 +21,187 @@ def calculate_age(create_date):
 
 
 def secret_exists(secret_name):
-
     try:
-        secretsmanager.describe_secret(
-            SecretId=secret_name
-        )
+        secretsmanager.describe_secret(SecretId=secret_name)
         return True
-
     except secretsmanager.exceptions.ResourceNotFoundException:
         return False
 
 
 def store_secret(username, access_key):
-
     secret_name = f"iam/{username}/access-key"
-
     secret_value = {
         "AccessKeyId": access_key["AccessKeyId"],
         "SecretAccessKey": access_key["SecretAccessKey"]
     }
 
     if secret_exists(secret_name):
-
         secretsmanager.put_secret_value(
             SecretId=secret_name,
             SecretString=json.dumps(secret_value)
         )
-
     else:
-
         secretsmanager.create_secret(
             Name=secret_name,
             SecretString=json.dumps(secret_value)
         )
 
 
-def publish_notification(message):
-
+def publish_notification(subject, message):
     if not SNS_TOPIC_ARN:
+        print("SNS Topic ARN not configured. Notification skipped.")
         return
-
+    
     sns.publish(
         TopicArn=SNS_TOPIC_ARN,
-        Subject="IAM Access Key Rotation",
+        Subject=subject,
         Message=message
     )
 
 
-def rotate_user_keys(username):
-
-    response = iam.list_access_keys(
-        UserName=username
+def log_metrics_to_cloudwatch(summary):
+    cloudwatch.put_metric_data(
+        Namespace='IAM/KeyRotationAutomation',
+        MetricData=[
+            {
+                'MetricName': 'RotatedUsers',
+                'Value': len(summary['rotated_users']),
+                'Unit': 'Count'
+            },
+            {
+                'MetricName': 'WarnedUsers',
+                'Value': len(summary['warned_users']),
+                'Unit': 'Count'
+            },
+            {
+                'MetricName': 'FailedUsers',
+                'Value': len(summary['failed_users']),
+                'Unit': 'Count'
+            }
+        ]
     )
 
-    keys = response["AccessKeyMetadata"]
 
-    active_keys = [
-        k for k in keys
-        if k["Status"] == "Active"
-    ]
+def rotate_user_keys(username, execution_summary):
+    response = iam.list_access_keys(UserName=username)
+    keys = response["AccessKeyMetadata"]
+    active_keys = [k for k in keys if k["Status"] == "Active"]
 
     for old_key in active_keys:
+        age = calculate_age(old_key["CreateDate"])
+        key_id = old_key["AccessKeyId"]
+        days_until_rotation = MAX_KEY_AGE - age
 
-        age = calculate_age(
-            old_key["CreateDate"]
-        )
+        if days_until_rotation == WARNING_DAYS_1 or days_until_rotation == WARNING_DAYS_2:
+            print(f"Sending pre-rotation notice for {username} (Key: {key_id})")
+            
+            msg = (
+                f"User: {username}\n"
+                f"Access Key: {key_id}\n"
+                f"Current Age: {age} days old.\n\n"
+                f"Notice: This key will be automatically rotated in {days_until_rotation} days."
+            )
+            publish_notification(
+                subject=f"URGENT: IAM Access Key Rotation Warning - {days_until_rotation} Days Left",
+                message=msg
+            )
+            execution_summary["warned_users"].append(f"{username} ({days_until_rotation} days left)")
+            continue 
 
         if age < MAX_KEY_AGE:
             continue
 
-        print(
-            f"{username} "
-            f"has stale key "
-            f"{old_key['AccessKeyId']}"
-        )
+        print(f"{username} has stale key {key_id} (Age: {age} days)")
 
         newer_active_keys = [
             k for k in active_keys
-            if (
-                k["AccessKeyId"]
-                != old_key["AccessKeyId"]
-            )
-            and calculate_age(
-                k["CreateDate"]
-            ) < MAX_KEY_AGE
+            if k["AccessKeyId"] != key_id and calculate_age(k["CreateDate"]) < MAX_KEY_AGE
         ]
 
-        #
-        # IDEMPOTENCY CHECK
-        #
         if newer_active_keys:
-
-            print(
-                f"{username} already rotated."
-            )
+            print(f"{username} has a newer valid key.")
             continue
 
-        #
-        # IAM MAXIMUM = 2 KEYS
-        #
         if len(keys) >= 2:
-
-            print(
-                f"{username} already has "
-                f"2 keys. Skipping."
-            )
-
+            print(f"CRITICAL: {username} has 2 keys. Manual cleanup required.")
+            execution_summary["failed_users"].append(f"{username} (Max keys limit reached)")
             continue
 
-        #
-        # CREATE NEW KEY
-        #
-        new_key = iam.create_access_key(
-            UserName=username
-        )["AccessKey"]
+        new_key = iam.create_access_key(UserName=username)["AccessKey"]
+        store_secret(username, new_key)
 
-        print(
-            f"Created new key "
-            f"{new_key['AccessKeyId']}"
-        )
-
-        #
-        # STORE IN SECRETS MANAGER
-        #
-        store_secret(
-            username,
-            new_key
-        )
-
-        #
-        # DEACTIVATE OLD KEY
-        #
         iam.update_access_key(
             UserName=username,
-            AccessKeyId=old_key["AccessKeyId"],
+            AccessKeyId=key_id,
             Status="Inactive"
         )
-
-        print(
-            f"Disabled old key "
-            f"{old_key['AccessKeyId']}"
-        )
-
-        publish_notification(
-            f"""
-User: {username}
-
-Old Key:
-{old_key['AccessKeyId']}
-
-New Key:
-{new_key['AccessKeyId']}
-
-Status:
-Rotation Successful
-"""
-        )
+        print(f"Disabled old key {key_id} for {username}")
+        
+        execution_summary["rotated_users"].append(username)
 
 
 def lambda_handler(event, context):
-
-    paginator = iam.get_paginator(
-        'list_users'
-    )
-
-    total_users = 0
-    rotated_users = 0
+    paginator = iam.get_paginator('list_users')
+    
+    execution_summary = {
+        "total_scanned": 0,
+        "rotated_users": [],
+        "warned_users": [],
+        "failed_users": []
+    }
 
     for page in paginator.paginate():
-
         for user in page["Users"]:
-
-            total_users += 1
-
+            execution_summary["total_scanned"] += 1
             try:
-
-                rotate_user_keys(
-                    user["UserName"]
-                )
-
-                rotated_users += 1
-
+                rotate_user_keys(user["UserName"], execution_summary)
             except Exception as e:
+                print(f"Error processing {user['UserName']}: {str(e)}")
+                execution_summary["failed_users"].append(f"{user['UserName']} (Error: {str(e)})")
 
-                print(
-                    f"Error processing "
-                    f"{user['UserName']} : {str(e)}"
-                )
+    total_rotated = len(execution_summary["rotated_users"])
+    
+    rotated_list_str = "\n".join([f"- {u}" for u in execution_summary["rotated_users"]]) if execution_summary["rotated_users"] else "- None"
+    warned_list_str = "\n".join([f"- {u}" for u in execution_summary["warned_users"]]) if execution_summary["warned_users"] else "- None"
+    failed_list_str = "\n".join([f"- {u}" for u in execution_summary["failed_users"]]) if execution_summary["failed_users"] else "- None"
+
+    summary_email_body = f"""
+IAM Access Key Rotation Job Summary
+=============================================
+Total IAM Users Scanned: {execution_summary['total_scanned']}
+Total Users Rotated:     {total_rotated}
+Total Users Warned:      {len(execution_summary['warned_users'])}
+Total Failures/Blocks:   {len(execution_summary['failed_users'])}
+
+Users Successfully Rotated:
+---------------------------------------------
+{rotated_list_str}
+
+Users Sent Pre-Rotation Warnings:
+---------------------------------------------
+{warned_list_str}
+
+Failed / Action Required Accounts:
+---------------------------------------------
+{failed_list_str}
+    """
+
+    print("Sending overall execution summary report email...")
+    publish_notification(
+        subject=f"IAM Key Rotation Summary: {total_rotated} Users Rotated",
+        message=summary_email_body
+    )
+
+    print("Logging evaluation metrics to CloudWatch...")
+    try:
+        log_metrics_to_cloudwatch(execution_summary)
+    except Exception as e:
+        print(f"Failed to log metrics to CloudWatch: {str(e)}")
 
     return {
         "statusCode": 200,
-        "body": json.dumps(
-            {
-                "users_processed": total_users,
-                "rotated_users": rotated_users
-            }
-        )
+        "body": json.dumps({
+            "total_users_scanned": execution_summary["total_scanned"],
+            "total_users_rotated": total_rotated
+        })
     }
